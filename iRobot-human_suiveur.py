@@ -91,7 +91,7 @@ try:
             
             print(f"Humain à {distance_m:.2f} m | Décalage X: {offset_x:.0f}px")
             
-            DEADZONE = 45  # Marge de tolérance en pixels pour considérer que le visage est au centre
+            DEADZONE = 400  # Marge de tolérance en pixels pour considérer que le visage est au centre
             
             # Règle 1 & 2 : Si l'humain est à gauche ou à droite, le robot tourne sur place pour le centrer
             if offset_x < -DEADZONE:
@@ -105,15 +105,14 @@ try:
                 motor_right.backward(speed=0.25)
                 
             else:
-                # Règle 3 : L'humain est bien au centre, on gère la zone de distance (entre 1m et 2m)
-                if distance_m > 2.0:
+                # Règle 3 : L'humain est bien au centre, on gère la zone de distance
+                if distance_m > 1:
                     print(" -> Humain à plus de 2m, j'avance pour me rapprocher.")
                     motor_left.forward(speed=0.35)
                     motor_right.forward(speed=0.35)
-                elif distance_m < 1.0:
-                    print(" -> Humain à moins de 1m, je recule.")
-                    motor_left.backward(speed=0.35)
-                    motor_right.backward(speed=0.35)
+                elif distance_m < 0.5:
+                    print(" -> Humain à moins de 1m, je m'arrête (trop près).")
+                    arreter_robots()  # <-- Changé ici : on arrête au lieu de reculer
                 else:
                     print(" -> Parfait : Centré et entre 1m et 2m, je m'arrête.")
                     arreter_robots()
@@ -126,6 +125,7 @@ try:
             print("Aucun humain en vue... Recherche en cours.")
             #motor_left.forward(speed=0.2)
             #motor_right.backward(speed=0.2)
+            arreter_robots()
 
         # Affichage de la vidéo
         cv2.imshow("Robot Suiveur", frame_bgr)
@@ -144,4 +144,4 @@ finally:
     picam2.stop()
     picam2.close()
     cv2.destroyAllWindows()
-    print("Programme arrêté proprement.")
+    print("Programme arrêté proprement.") 
