@@ -1,6 +1,7 @@
-import time
 import os
+import time
 import cv2
+import numpy as np
 from picamera2 import Picamera2
 from libcamera import Transform
 from gpiozero import Motor
@@ -17,37 +18,57 @@ IN4 = 27
 motor_left = Motor(forward=IN1, backward=IN2, enable=ENA)
 motor_right = Motor(forward=IN3, backward=IN4, enable=ENB)
 
-# --- PARAMÈTRES DE DISTANCE ET VISION ---
-KNOWN_WIDTH = 15.0  # Largeur moyenne d'un visage en cm
-FOCAL_LENGTH = 550  # Votre focale étalonnée pour l'InnoMaker
+# --- PARAMÈTRES DE DISTANCE ET VISION (Mode Proche < 30cm) ---
+KNOWN_WIDTH = 15.0   # Largeur moyenne d'un visage en cm
+FOCAL_LENGTH = 550   # Focale étalonnée
+
+TARGET_DIST_CM = 30.0  # Distance maximale tolérée (le robot essaie de rester en dessous)
+MIN_DIST_CM = 15.0     # Seuil de sécurité minimal pour reculer
+
+# Vesses de rotation et de déplacement adaptées au suivi rapproché
+SPEED_TURN = 0.25
+SPEED_MOVE = 0.4
 
 # --- VÉRIFICATION DU MODÈLE ONNX ---
 model_file = "face_detection_yunet_2023mar.onnx"
-
 if not os.path.exists(model_file):
-    print(f"ERREUR : Le fichier '{model_file}' est introuvable dans ce dossier !")
+    print(f"ERREUR : Le fichier '{model_file}' est introuvable !")
     exit(1)
 
 # Chargement du réseau de neurones YuNet
 net = cv2.FaceDetectorYN.create(
-    model_file, "", (300, 300), 
-    score_threshold=0.6, 
+    model_file, "", (320, 320), 
+    score_threshold=0.45, 
     nms_threshold=0.3, 
     top_k=5000
 )
 
-# --- INITIALISATION DE LA CAMÉRA ---
+# --- INITIALISATION DE LA CAMÉRA (640x480) ---
 picam2 = Picamera2()
-config = picam2.create_video_configuration(transform=Transform(hflip=1, vflip=1))
+config = picam2.create_video_configuration(
+    main={"size": (640, 480), "format": "RGB888"},
+    transform=Transform(hflip=0, vflip=1)
+)
 picam2.configure(config)
-
+picam2.set_controls({"ExposureValue": 2.0})
 picam2.start()
 
-print("Robot Suiveur Intelligent démarré ! Appuyez sur 'q' ou Ctrl+C pour quitter...")
+print("Robot Suiveur Rapproché (< 30 cm) démarré !")
+print("Appuyez sur Ctrl+C pour quitter...")
 
 def arreter_robots():
     motor_left.stop()
     motor_right.stop()
+
+derniere_boite = None
+compteur_perte = 0
+MAX_PERTE_FRAMES = 5  
+
+# Pré-calcul de la table Gamma pour la luminosité
+gamma = 0.5  
+invGamma = 1.0 / gamma
+gamma_table = np.array([((i / 255.0) ** invGamma) * 255 for i in np.arange(0, 256)]).astype("uint8")
+clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
 
 try:
     while True:
@@ -55,93 +76,94 @@ try:
         frame = picam2.capture_array()
         frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         
-        h_img, w_img, _ = frame_bgr.shape
+        # 2. Traitement d'image (Gamma + CLAHE)
+        frame_gamma = cv2.LUT(frame_bgr, gamma_table)
+        lab = cv2.cvtColor(frame_gamma, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        l = clahe.apply(l)
+        lab = cv2.merge((l, a, b))
+        frame_bgr_traite = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+        
+        h_img, w_img, _ = frame_bgr_traite.shape
         net.setInputSize((w_img, h_img))
         
-        # 2. Détection
-        _, faces = net.detect(frame_bgr)
+        # 3. Détection des visages
+        _, faces = net.detect(frame_bgr_traite)
         
-        humain_trouve = False
+        fresh_detection = False
         best_w = 0
         best_box = None
         
-        # 3. Analyse des visages détectés
         if faces is not None:
             for face in faces:
                 confidence = face[-1]
-                if confidence > 0.6:
-                    humain_trouve = True
+                if confidence > 0.45:
+                    fresh_detection = True
                     x, y, w, h = int(face[0]), int(face[1]), int(face[2]), int(face[3])
                     if w > best_w:
                         best_w = w
                         best_box = (x, y, w, h)
 
-        # 4. Comportement du robot selon vos règles
+        # Gestion de la mémoire (lissage de perte de frame)
+        en_memoire = False
+        if fresh_detection and best_box is not None:
+            derniere_boite = best_box
+            compteur_perte = 0
+            humain_trouve = True
+        elif derniere_boite is not None and compteur_perte < MAX_PERTE_FRAMES:
+            best_box = derniere_boite
+            compteur_perte += 1
+            humain_trouve = True
+            en_memoire = True 
+        else:
+            derniere_boite = None
+            humain_trouve = False
+
+        # 4. Comportement du robot
         if humain_trouve and best_box is not None:
             x, y, w, h = best_box
             
-            # Calcul de la distance
+            # Calcul de la distance en cm basée sur la largeur du visage
             distance_cm = (KNOWN_WIDTH * FOCAL_LENGTH) / w
-            distance_m = distance_cm / 100.0
             
-            # Calcul du positionnement horizontal (centre du visage vs centre de la caméra)
             face_center_x = x + (w / 2)
             image_center_x = w_img / 2
-            offset_x = face_center_x - image_center_x  # Négatif = à gauche, Positif = à droite
+            offset_x = face_center_x - image_center_x  
             
-            print(f"Humain à {distance_m:.2f} m | Décalage X: {offset_x:.0f}px")
+            DEADZONE = 100  # Marge de tolérance horizontale pour 640px
             
-            DEADZONE = 400  # Marge de tolérance en pixels pour considérer que le visage est au centre
-            
-            # Règle 1 & 2 : Si l'humain est à gauche ou à droite, le robot tourne sur place pour le centrer
+            # PRIORITÉ 1 : Centrage horizontal
             if offset_x < -DEADZONE:
-                print(" -> Humain sur la gauche, je tourne vers la gauche.")
-                motor_left.backward(speed=0.25)
-                motor_right.forward(speed=0.25)
-                
+                motor_left.backward(speed=SPEED_TURN)
+                motor_right.forward(speed=SPEED_TURN)
             elif offset_x > DEADZONE:
-                print(" -> Humain sur la droite, je tourne vers la droite.")
-                motor_left.forward(speed=0.25)
-                motor_right.backward(speed=0.25)
-                
+                motor_left.forward(speed=SPEED_TURN)
+                motor_right.backward(speed=SPEED_TURN)
             else:
-                # Règle 3 : L'humain est bien au centre, on gère la zone de distance
-                if distance_m > 1:
-                    print(" -> Humain à plus de 2m, j'avance pour me rapprocher.")
-                    motor_left.forward(speed=0.35)
-                    motor_right.forward(speed=0.35)
-                elif distance_m < 0.5:
-                    print(" -> Humain à moins de 1m, je m'arrête (trop près).")
-                    arreter_robots()  # <-- Changé ici : on arrête au lieu de reculer
+                # PRIORITÉ 2 : Gestion de la distance rapprochée (< 30 cm)
+                if distance_cm > TARGET_DIST_CM:
+                    # Trop loin (> 30 cm), le robot avance pour se rapprocher
+                    motor_left.forward(speed=SPEED_MOVE)
+                    motor_right.forward(speed=SPEED_MOVE)
+                elif distance_cm < MIN_DIST_CM:
+                    # Trop près (< 15 cm), sécurité pour reculer
+                    motor_left.backward(speed=0.3)
+                    motor_right.backward(speed=0.3)
                 else:
-                    print(" -> Parfait : Centré et entre 1m et 2m, je m'arrête.")
+                    # Zone idéale (entre 15 cm et 30 cm) : position stable atteinte
                     arreter_robots()
-                
-            # Dessiner le rectangle vert autour du visage
-            cv2.rectangle(frame_bgr, (x, y), (x + w, y + h), (0, 255, 0), 2)
-            
         else:
-            # Aucun humain : Le robot tourne sur lui-même pour chercher
-            print("Aucun humain en vue... Recherche en cours.")
-            #motor_left.forward(speed=0.2)
-            #motor_right.backward(speed=0.2)
             arreter_robots()
-
-        # Affichage de la vidéo
-        cv2.imshow("Robot Suiveur", frame_bgr)
-        
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            print("\nArrêt du programme...")
-            break
-
-        time.sleep(0.05)
 
 except KeyboardInterrupt:
     print("\nArrêt d'urgence demandé.")
 
 finally:
     arreter_robots()
-    picam2.stop()
-    picam2.close()
+    try:
+        picam2.stop()
+        picam2.close()
+    except Exception:
+        pass
     cv2.destroyAllWindows()
-    print("Programme arrêté proprement.") 
+    print("Programme arrêté proprement.")
